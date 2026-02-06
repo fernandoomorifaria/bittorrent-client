@@ -1,37 +1,16 @@
-﻿open System.Text
+﻿open System
+open System.IO
+open System.Text
+open System.Threading
+open System.Threading.Tasks
 open System.Linq
 open System.Net
 open System.Net.Http
+open System.Net.Sockets
 open BencodeNET.Parsing
 open BencodeNET.Objects
 open BencodeNET.Torrents
-
-type Event =
-    | Started
-    | Stopped
-    | Completed
-
-    override this.ToString() =
-        match this with
-        | Started -> "started"
-        | Stopped -> "stopped"
-        | Completed -> "completed"
-
-type TrackerParameters =
-    { InfoHash: byte array
-      PeerId: byte array
-      Port: int
-      Uploaded: int
-      Downloaded: int
-      Left: int64
-      Event: Event }
-
-type Peer = { Ip: IPAddress; Port: uint16 }
-
-type TrackerResponse =
-    { // FailureReason: string option
-      Interval: int
-      Peers: Peer array }
+open Types
 
 let encodeBytes (bytes: byte[]) =
     bytes |> Array.map (fun b -> sprintf "%%%02x" b) |> String.concat ""
@@ -45,13 +24,15 @@ let buildTrackerUrl (baseUrl: string) (parameters: TrackerParameters) =
           "downloaded", string parameters.Downloaded
           "left", string parameters.Left
           "compact", "1"
-          "event", parameters.Event.ToString() ]
+          "event", parameters.Event.ToString()
+          "numwant", string 200 ]
         |> Seq.map (fun (k, v) -> sprintf "%s=%s" k v)
         |> String.concat "&"
 
     $"{baseUrl}?{query}"
 
 let client = new HttpClient()
+client.DefaultRequestHeaders.Add("User-Agent", "qBittorrent/5.1.4")
 
 let parser = BencodeParser()
 
@@ -68,7 +49,7 @@ let announceHttpTracker (baseUrl: string) (parameters: TrackerParameters) =
 
         let dictionary = parser.Parse<BDictionary> response
 
-        let peersBytes = dictionary.Get<BString>("peers").EncodeAsBytes()
+        let peersBytes = dictionary.Get<BString>("peers").Value.ToArray()
 
         let peers =
             peersBytes
@@ -89,11 +70,13 @@ let announceHttpTracker (baseUrl: string) (parameters: TrackerParameters) =
 
 let announce (baseUrl: string) (parameters: TrackerParameters) =
     task {
+        // TODO: Implement announce to UDP tracker
+
         let! response = announceHttpTracker baseUrl parameters
 
-        printfn "%A" response
+        printfn "Peers: %i" response.Peers.Length
 
-        ()
+        return response
     }
 
 let left (torrent: Torrent) =
@@ -102,10 +85,81 @@ let left (torrent: Torrent) =
     else
         torrent.Files |> Seq.sumBy (fun file -> file.FileSize)
 
-let peerId = "-qB4500-abc123def456"
+let serializeHandshake (handshake: Handshake) =
+    let protocolBytes = Encoding.ASCII.GetBytes handshake.Protocol
 
-// TODO: Iterate other trackers
-let baseUrl = torrent.Trackers.First().First()
+    Array.concat
+        [ [| byte protocolBytes.Length |]
+          protocolBytes
+          Array.zeroCreate 8
+          handshake.InfoHash
+          handshake.PeerId ]
+
+let deserializeHandshake (buffer: byte array) =
+    let protocolLength = buffer.[0]
+    let protocol = Encoding.ASCII.GetString(buffer, 1, int protocolLength)
+    let infoHash = buffer.[28..47]
+    let peerId = buffer.[48..67]
+
+    { Protocol = protocol
+      InfoHash = infoHash
+      PeerId = peerId }
+
+let connectToPeer (peer: Peer) (handshake: Handshake) : Task<PeerConnection option> =
+    task {
+        let client = new TcpClient()
+
+        client.ReceiveTimeout <- 5_000
+        client.SendTimeout <- 5_000
+
+        use cts = new CancellationTokenSource 5_000
+
+        try
+            do! client.ConnectAsync(peer.Ip, peer.Port |> int, cts.Token)
+
+            let stream = client.GetStream()
+
+            let bytes = serializeHandshake handshake
+
+            do! stream.WriteAsync bytes
+
+            let! buffer = stream.AsyncRead 68
+
+            let response = deserializeHandshake buffer
+
+            if handshake.InfoHash <> response.InfoHash then
+                client.Close()
+
+                return None
+            else
+                printfn "Connected to %s" (peer.Ip.ToString())
+
+                return Some { Connection = client; Peer = peer }
+        with
+        | :? SocketException
+        | :? IOException
+        | :? OperationCanceledException ->
+            client.Close()
+
+            printfn "Failed to connect to peer %s" (peer.Ip.ToString())
+
+            return None
+    }
+
+let connectToPeers (peers: Peer array) (handshake: Handshake) =
+    task {
+        let! results = peers |> Array.map (fun peer -> connectToPeer peer handshake) |> Task.WhenAll
+
+        let connections = Array.choose id results
+
+        return connections
+    }
+
+let peerId = "-qB5140-kwsSnUYwydys"
+
+printfn "%A" torrent.Trackers
+
+let baseUrl = torrent.Trackers.Last().First()
 
 let request =
     { InfoHash = torrent.OriginalInfoHashBytes
@@ -117,4 +171,19 @@ let request =
       Event = Started }
 
 // TODO: Announce for each tracker
-announce baseUrl request |> Async.AwaitTask |> Async.RunSynchronously
+let response = announce baseUrl request |> Async.AwaitTask |> Async.RunSynchronously
+
+let handshake =
+    { Protocol = "BitTorrent protocol"
+      InfoHash = torrent.OriginalInfoHashBytes
+      PeerId = Encoding.ASCII.GetBytes peerId }
+
+let connections =
+    connectToPeers response.Peers handshake
+    |> Async.AwaitTask
+    |> Async.RunSynchronously
+
+printfn "Connections: %i" connections.Length
+
+// TODO: Implement message loop, for now just close the connections
+connections |> Array.iter (fun peer -> peer.Connection.Close())
