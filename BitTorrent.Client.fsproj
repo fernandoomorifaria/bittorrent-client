@@ -7,6 +7,8 @@
 
   <ItemGroup>
     <Compile Include="Types.fs" />
+    <Compile Include="Utils.fs" />
+    <Compile Include="Tracker.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

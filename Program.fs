@@ -1,89 +1,15 @@
 ﻿open System
 open System.IO
+open System.Linq
 open System.Text
 open System.Threading
 open System.Threading.Tasks
-open System.Linq
-open System.Net
-open System.Net.Http
 open System.Net.Sockets
 open BencodeNET.Parsing
-open BencodeNET.Objects
 open BencodeNET.Torrents
 open Types
 
-let encodeBytes (bytes: byte[]) =
-    bytes |> Array.map (fun b -> sprintf "%%%02x" b) |> String.concat ""
-
-let buildTrackerUrl (baseUrl: string) (parameters: TrackerParameters) =
-    let query =
-        [ "info_hash", encodeBytes parameters.InfoHash
-          "peer_id", encodeBytes parameters.PeerId
-          "port", string parameters.Port
-          "uploaded", string parameters.Uploaded
-          "downloaded", string parameters.Downloaded
-          "left", string parameters.Left
-          "compact", "1"
-          "event", parameters.Event.ToString()
-          "numwant", string 200 ]
-        |> Seq.map (fun (k, v) -> sprintf "%s=%s" k v)
-        |> String.concat "&"
-
-    $"{baseUrl}?{query}"
-
-let client = new HttpClient()
-client.DefaultRequestHeaders.Add("User-Agent", "qBittorrent/5.1.4")
-
 let parser = BencodeParser()
-
-let torrent =
-    parser.Parse<Torrent> "./kali-linux-2025.4-installer-amd64.iso.torrent"
-
-let announceHttpTracker (baseUrl: string) (parameters: TrackerParameters) =
-    task {
-        let url = buildTrackerUrl baseUrl parameters
-
-        printfn "%s" url
-
-        let! response = client.GetByteArrayAsync url
-
-        let dictionary = parser.Parse<BDictionary> response
-
-        let peersBytes = dictionary.Get<BString>("peers").Value.ToArray()
-
-        let peers =
-            peersBytes
-            |> Array.chunkBySize 6
-            |> Array.filter (fun chunk -> chunk.Length = 6)
-            |> Array.map (fun chunk ->
-                let ip = IPAddress(chunk[0..3])
-                let port = uint16 chunk[4] <<< 8 ||| uint16 chunk[5]
-
-                { Ip = ip; Port = port })
-
-        let trackerResponse =
-            { Interval = dictionary.Get<BNumber>("interval").Value |> int
-              Peers = peers }
-
-        return trackerResponse
-    }
-
-let announce (baseUrl: string) (parameters: TrackerParameters) =
-    task {
-        // TODO: Implement announce to UDP tracker
-
-        let! response = announceHttpTracker baseUrl parameters
-
-        printfn "Peers: %i" response.Peers.Length
-
-        return response
-    }
-
-let left (torrent: Torrent) =
-    if torrent.FileMode = TorrentFileMode.Single then
-        torrent.File.FileSize
-    else
-        torrent.Files |> Seq.sumBy (fun file -> file.FileSize)
 
 let serializeHandshake (handshake: Handshake) =
     let protocolBytes = Encoding.ASCII.GetBytes handshake.Protocol
@@ -155,10 +81,15 @@ let connectToPeers (peers: Peer array) (handshake: Handshake) =
         return connections
     }
 
+[<Literal>]
 let peerId = "-qB5140-kwsSnUYwydys"
+
+let torrent =
+    parser.Parse<Torrent> "./kali-linux-2025.4-installer-amd64.iso.torrent"
 
 printfn "%A" torrent.Trackers
 
+// TODO: Announce for each tracker
 let baseUrl = torrent.Trackers.Last().First()
 
 let request =
@@ -167,11 +98,11 @@ let request =
       Port = 58237
       Uploaded = 0
       Downloaded = 0
-      Left = left torrent
+      Left = Utils.getBytesRemaining torrent
       Event = Started }
 
-// TODO: Announce for each tracker
-let response = announce baseUrl request |> Async.AwaitTask |> Async.RunSynchronously
+let response =
+    Tracker.announce baseUrl request |> Async.AwaitTask |> Async.RunSynchronously
 
 let handshake =
     { Protocol = "BitTorrent protocol"
