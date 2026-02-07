@@ -2,7 +2,7 @@
 open System.Text
 open BencodeNET.Parsing
 open BencodeNET.Torrents
-open Types
+open BitTorrent.Client
 
 let parser = BencodeParser()
 

@@ -1,79 +1,99 @@
-module Peer
+namespace BitTorrent.Client
 
 open System
 open System.IO
 open System.Text
 open System.Threading
 open System.Threading.Tasks
+open System.Net
 open System.Net.Sockets
-open Types
 
-let private serializeHandshake (handshake: Handshake) =
-    let protocolBytes = Encoding.ASCII.GetBytes handshake.Protocol
+type Handshake =
+    { Protocol: string
+      InfoHash: byte array
+      PeerId: byte array }
 
-    Array.concat
-        [ [| byte protocolBytes.Length |]
-          protocolBytes
-          Array.zeroCreate 8
-          handshake.InfoHash
-          handshake.PeerId ]
+type Peer = { Ip: IPAddress; Port: uint16 }
 
-let private deserializeHandshake (buffer: byte array) =
-    let protocolLength = buffer.[0]
-    let protocol = Encoding.ASCII.GetString(buffer, 1, int protocolLength)
-    let infoHash = buffer.[28..47]
-    let peerId = buffer.[48..67]
+type PeerConnection =
+    { Peer: Peer
+      Connection: TcpClient
+      // Here I stand, slowly choking
+      Choked: bool
+      Interested: bool }
 
-    { Protocol = protocol
-      InfoHash = infoHash
-      PeerId = peerId }
+module Peer =
+    let private serializeHandshake (handshake: Handshake) =
+        let protocolBytes = Encoding.ASCII.GetBytes handshake.Protocol
 
-let private connectToPeer (peer: Peer) (handshake: Handshake) : Task<PeerConnection option> =
-    task {
-        let client = new TcpClient()
+        Array.concat
+            [ [| byte protocolBytes.Length |]
+              protocolBytes
+              Array.zeroCreate 8
+              handshake.InfoHash
+              handshake.PeerId ]
 
-        client.ReceiveTimeout <- 5_000
-        client.SendTimeout <- 5_000
+    let private deserializeHandshake (buffer: byte array) =
+        let protocolLength = buffer.[0]
+        let protocol = Encoding.ASCII.GetString(buffer, 1, int protocolLength)
+        let infoHash = buffer.[28..47]
+        let peerId = buffer.[48..67]
 
-        use cts = new CancellationTokenSource 5_000
+        { Protocol = protocol
+          InfoHash = infoHash
+          PeerId = peerId }
 
-        try
-            do! client.ConnectAsync(peer.Ip, peer.Port |> int, cts.Token)
+    let private connectToPeer (peer: Peer) (handshake: Handshake) : Task<PeerConnection option> =
+        task {
+            let client = new TcpClient()
 
-            let stream = client.GetStream()
+            client.ReceiveTimeout <- 5_000
+            client.SendTimeout <- 5_000
 
-            let bytes = serializeHandshake handshake
+            use cts = new CancellationTokenSource 5_000
 
-            do! stream.WriteAsync bytes
+            try
+                do! client.ConnectAsync(peer.Ip, peer.Port |> int, cts.Token)
 
-            let! buffer = stream.AsyncRead 68
+                let stream = client.GetStream()
 
-            let response = deserializeHandshake buffer
+                let bytes = serializeHandshake handshake
 
-            if handshake.InfoHash <> response.InfoHash then
+                do! stream.WriteAsync bytes
+
+                let! buffer = stream.AsyncRead 68
+
+                let response = deserializeHandshake buffer
+
+                if handshake.InfoHash <> response.InfoHash then
+                    client.Close()
+
+                    return None
+                else
+                    printfn "Connected to %s" (peer.Ip.ToString())
+
+                    return
+                        Some
+                            { Connection = client
+                              Peer = peer
+                              Choked = true
+                              Interested = false }
+            with
+            | :? SocketException
+            | :? IOException
+            | :? OperationCanceledException ->
                 client.Close()
 
+                printfn "Failed to connect to peer %s" (peer.Ip.ToString())
+
                 return None
-            else
-                printfn "Connected to %s" (peer.Ip.ToString())
+        }
 
-                return Some { Connection = client; Peer = peer }
-        with
-        | :? SocketException
-        | :? IOException
-        | :? OperationCanceledException ->
-            client.Close()
+    let connectToPeers (peers: Peer array) (handshake: Handshake) =
+        task {
+            let! results = peers |> Array.map (fun peer -> connectToPeer peer handshake) |> Task.WhenAll
 
-            printfn "Failed to connect to peer %s" (peer.Ip.ToString())
+            let connections = Array.choose id results
 
-            return None
-    }
-
-let connectToPeers (peers: Peer array) (handshake: Handshake) =
-    task {
-        let! results = peers |> Array.map (fun peer -> connectToPeer peer handshake) |> Task.WhenAll
-
-        let connections = Array.choose id results
-
-        return connections
-    }
+            return connections
+        }
