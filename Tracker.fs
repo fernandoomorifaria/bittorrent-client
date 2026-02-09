@@ -31,9 +31,6 @@ type TrackerResponse =
       Peers: Peer array }
 
 module Tracker =
-    let private client = new HttpClient()
-    client.DefaultRequestHeaders.Add("User-Agent", "qBittorrent/5.1.4")
-
     let private parser = BencodeParser()
 
     let private buildTrackerUrl (baseUrl: string) (parameters: TrackerParameters) =
@@ -52,7 +49,7 @@ module Tracker =
 
         $"{baseUrl}?{query}"
 
-    let private announceHttpTracker (baseUrl: string) (parameters: TrackerParameters) =
+    let private announceHttpTracker (baseUrl: string) (parameters: TrackerParameters) (client: HttpClient) =
         task {
             let url = buildTrackerUrl baseUrl parameters
 
@@ -81,11 +78,12 @@ module Tracker =
             return trackerResponse
         }
 
-    let announce (baseUrl: string) (parameters: TrackerParameters) =
+    // NOTE: Create an abstraction for the client, maybe
+    let announce (baseUrl: string) (parameters: TrackerParameters) (client: HttpClient) =
         task {
             // TODO: Implement announce to UDP tracker
 
-            let! response = announceHttpTracker baseUrl parameters
+            let! response = announceHttpTracker baseUrl parameters client
 
             printfn "Peers: %i" response.Peers.Length
 

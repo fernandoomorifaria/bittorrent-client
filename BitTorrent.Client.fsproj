@@ -7,9 +7,9 @@
 
   <ItemGroup>
     <Compile Include="Utils.fs" />
-    <Compile Include="Message.fs" />
     <Compile Include="Peer.fs" />
     <Compile Include="Tracker.fs" />
+    <Compile Include="Message.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

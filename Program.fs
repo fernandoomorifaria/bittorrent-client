@@ -1,8 +1,13 @@
 ﻿open System.Linq
 open System.Text
+open System.Net.Http
 open BencodeNET.Parsing
 open BencodeNET.Torrents
 open BitTorrent.Client
+
+let client = new HttpClient()
+
+client.DefaultRequestHeaders.Add("User-Agent", "qBittorrent/5.1.4")
 
 let parser = BencodeParser()
 
@@ -23,11 +28,14 @@ let request =
       Port = 58237
       Uploaded = 0
       Downloaded = 0
-      Left = Utils.getBytesRemaining torrent
+      // TODO: Calculate the left size in case of calling the tracker again
+      Left = torrent.TotalSize
       Event = Started }
 
 let response =
-    Tracker.announce baseUrl request |> Async.AwaitTask |> Async.RunSynchronously
+    Tracker.announce baseUrl request client
+    |> Async.AwaitTask
+    |> Async.RunSynchronously
 
 let handshake =
     { Protocol = "BitTorrent protocol"
@@ -35,7 +43,7 @@ let handshake =
       PeerId = Encoding.ASCII.GetBytes peerId }
 
 let connections =
-    Peer.connectToPeers response.Peers handshake
+    Peer.connectToPeers response.Peers handshake torrent.NumberOfPieces
     |> Async.AwaitTask
     |> Async.RunSynchronously
 

@@ -1,6 +1,7 @@
 namespace BitTorrent.Client
 
 open System
+open System.Collections
 open System.IO
 open System.Text
 open System.Threading
@@ -18,9 +19,12 @@ type Peer = { Ip: IPAddress; Port: uint16 }
 type PeerConnection =
     { Peer: Peer
       Connection: TcpClient
+      Bitfield: BitArray
       // Here I stand, slowly choking
-      Choked: bool
-      Interested: bool }
+      AmChoking: bool
+      AmInterested: bool
+      PeerChoking: bool
+      PeerInterested: bool }
 
 module Peer =
     let private serializeHandshake (handshake: Handshake) =
@@ -43,7 +47,7 @@ module Peer =
           InfoHash = infoHash
           PeerId = peerId }
 
-    let private connectToPeer (peer: Peer) (handshake: Handshake) : Task<PeerConnection option> =
+    let private connectToPeer (peer: Peer) (handshake: Handshake) (numberOfPieces: int) : Task<PeerConnection option> =
         task {
             let client = new TcpClient()
 
@@ -76,8 +80,11 @@ module Peer =
                         Some
                             { Connection = client
                               Peer = peer
-                              Choked = true
-                              Interested = false }
+                              Bitfield = BitArray numberOfPieces
+                              AmChoking = true
+                              AmInterested = false
+                              PeerChoking = true
+                              PeerInterested = false }
             with
             | :? SocketException
             | :? IOException
@@ -89,9 +96,12 @@ module Peer =
                 return None
         }
 
-    let connectToPeers (peers: Peer array) (handshake: Handshake) =
+    let connectToPeers (peers: Peer array) (handshake: Handshake) (numberOfPieces: int) =
         task {
-            let! results = peers |> Array.map (fun peer -> connectToPeer peer handshake) |> Task.WhenAll
+            let! results =
+                peers
+                |> Array.map (fun peer -> connectToPeer peer handshake numberOfPieces)
+                |> Task.WhenAll
 
             let connections = Array.choose id results
 
