@@ -31,9 +31,31 @@ type TrackerResponse =
       Peers: Peer array }
 
 module Tracker =
-    let private parser = BencodeParser()
+    let parseTrackerResponse (response: byte array) =
+        let parser = BencodeParser()
 
-    let private buildTrackerUrl (baseUrl: string) (parameters: TrackerParameters) =
+        let dictionary = parser.Parse<BDictionary> response
+
+        let peersBytes = dictionary.Get<BString>("peers").Value.ToArray()
+
+        let peers =
+            peersBytes
+            |> Array.chunkBySize 6
+            |> Array.filter (fun chunk -> chunk.Length = 6)
+            |> Array.map (fun chunk ->
+                let ip = IPAddress(chunk[0..3])
+                let port = uint16 chunk[4] <<< 8 ||| uint16 chunk[5]
+
+                { Ip = ip; Port = port })
+
+        let trackerResponse =
+            { Interval = dictionary.Get<BNumber>("interval").Value |> int
+              Peers = peers }
+
+        trackerResponse
+
+
+    let buildTrackerUrl (baseUrl: string) (parameters: TrackerParameters) =
         let query =
             [ "info_hash", Utils.encodeBytes parameters.InfoHash
               "peer_id", Utils.encodeBytes parameters.PeerId
@@ -49,7 +71,7 @@ module Tracker =
 
         $"{baseUrl}?{query}"
 
-    let private announceHttpTracker (baseUrl: string) (parameters: TrackerParameters) (client: HttpClient) =
+    let announceHttpTracker (baseUrl: string) (parameters: TrackerParameters) (client: HttpClient) =
         task {
             let url = buildTrackerUrl baseUrl parameters
 
@@ -57,25 +79,7 @@ module Tracker =
 
             let! response = client.GetByteArrayAsync url
 
-            let dictionary = parser.Parse<BDictionary> response
-
-            let peersBytes = dictionary.Get<BString>("peers").Value.ToArray()
-
-            let peers =
-                peersBytes
-                |> Array.chunkBySize 6
-                |> Array.filter (fun chunk -> chunk.Length = 6)
-                |> Array.map (fun chunk ->
-                    let ip = IPAddress(chunk[0..3])
-                    let port = uint16 chunk[4] <<< 8 ||| uint16 chunk[5]
-
-                    { Ip = ip; Port = port })
-
-            let trackerResponse =
-                { Interval = dictionary.Get<BNumber>("interval").Value |> int
-                  Peers = peers }
-
-            return trackerResponse
+            return parseTrackerResponse response
         }
 
     // NOTE: Create an abstraction for the client, maybe

@@ -43,7 +43,7 @@ let handshake =
       PeerId = Encoding.ASCII.GetBytes peerId }
 
 let connections =
-    Peer.connectToPeers response.Peers handshake torrent.NumberOfPieces
+    Peer.connectToPeers response.Peers handshake
     |> Async.AwaitTask
     |> Async.RunSynchronously
 

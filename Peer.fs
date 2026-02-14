@@ -2,6 +2,7 @@ namespace BitTorrent.Client
 
 open System
 open System.Collections
+open System.Collections.Concurrent
 open System.IO
 open System.Text
 open System.Threading
@@ -19,15 +20,32 @@ type Peer = { Ip: IPAddress; Port: uint16 }
 type PeerConnection =
     { Peer: Peer
       Connection: TcpClient
-      Bitfield: BitArray
+      Bitfield: BitArray option
       // Here I stand, slowly choking
       AmChoking: bool
       AmInterested: bool
       PeerChoking: bool
       PeerInterested: bool }
 
+// TODO: Move this to another module
+type PieceWork =
+    { Piece: int
+      Hash: byte array
+      Length: int }
+
+type State =
+    { PieceHashes: byte array array
+      Pieces: ConcurrentDictionary<int, PieceWork>
+      NumberOfPieces: int
+      PieceSize: int
+      TotalSize: int64 }
+
+type PeerAction =
+    | SendInterested
+    | RequestBlocks
+
 module Peer =
-    let private serializeHandshake (handshake: Handshake) =
+    let serializeHandshake (handshake: Handshake) =
         let protocolBytes = Encoding.ASCII.GetBytes handshake.Protocol
 
         Array.concat
@@ -37,7 +55,7 @@ module Peer =
               handshake.InfoHash
               handshake.PeerId ]
 
-    let private deserializeHandshake (buffer: byte array) =
+    let deserializeHandshake (buffer: byte array) =
         let protocolLength = buffer.[0]
         let protocol = Encoding.ASCII.GetString(buffer, 1, int protocolLength)
         let infoHash = buffer.[28..47]
@@ -47,7 +65,11 @@ module Peer =
           InfoHash = infoHash
           PeerId = peerId }
 
-    let private connectToPeer (peer: Peer) (handshake: Handshake) (numberOfPieces: int) : Task<PeerConnection option> =
+    let hasPiecesWeNeed (bitfield: BitArray) (pieces: ConcurrentDictionary<int, PieceWork>) =
+        pieces |> Seq.exists (fun piece -> bitfield.Get piece.Key)
+
+
+    let connectToPeer (peer: Peer) (handshake: Handshake) : Task<PeerConnection option> =
         task {
             let client = new TcpClient()
 
@@ -80,7 +102,7 @@ module Peer =
                         Some
                             { Connection = client
                               Peer = peer
-                              Bitfield = BitArray numberOfPieces
+                              Bitfield = None
                               AmChoking = true
                               AmInterested = false
                               PeerChoking = true
@@ -96,12 +118,9 @@ module Peer =
                 return None
         }
 
-    let connectToPeers (peers: Peer array) (handshake: Handshake) (numberOfPieces: int) =
+    let connectToPeers (peers: Peer array) (handshake: Handshake) =
         task {
-            let! results =
-                peers
-                |> Array.map (fun peer -> connectToPeer peer handshake numberOfPieces)
-                |> Task.WhenAll
+            let! results = peers |> Array.map (fun peer -> connectToPeer peer handshake) |> Task.WhenAll
 
             let connections = Array.choose id results
 
