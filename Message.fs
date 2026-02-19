@@ -3,7 +3,6 @@ namespace BitTorrent.Client
 open System
 open System.Buffers.Binary
 open System.Collections
-open Peer
 
 type MessageId =
     | Choke = 0
@@ -23,11 +22,19 @@ type Message =
     | NotInterested
     | Have of piece: int
     | Bitfield of bitfield: BitArray
-    | Request of piece: int * ``begin``: int * length: int
-    | Piece of piece: int * ``begin``: int * block: byte array
-    | Cancel of piece: int * ``begin``: int * length: int
+    | Request of piece: int * offset: int * length: int
+    | Piece of piece: int * offset: int * block: byte array
+    | Cancel of piece: int * offset: int * length: int
+
+type CoordinatorMessage =
+    | HasUsefulPieces of pieces: BitArray * replyChannel: AsyncReplyChannel<bool>
+    | RequestPiece of replyChannel: AsyncReplyChannel<PieceWork option>
+    | PieceReceived
 
 module Message =
+    open System.Net.Sockets
+    open System.Threading.Tasks
+
     [<Literal>]
     let BlockSize = 16384
 
@@ -57,26 +64,26 @@ module Message =
                 [ writeBigEndian (1 + bitfieldBytes.Length)
                   messageId MessageId.Bitfield
                   bitfieldBytes ]
-        | Request(piece, ``begin``, length) ->
+        | Request(piece, offset, length) ->
             Array.concat
                 [ writeBigEndian 13
                   messageId MessageId.Request
                   writeBigEndian piece
-                  writeBigEndian ``begin``
+                  writeBigEndian offset
                   writeBigEndian length ]
-        | Piece(piece, ``begin``, block) ->
+        | Piece(piece, offset, block) ->
             Array.concat
                 [ writeBigEndian (9 + block.Length)
                   messageId MessageId.Piece
                   writeBigEndian piece
-                  writeBigEndian ``begin``
+                  writeBigEndian offset
                   block ]
-        | Cancel(piece, ``begin``, length) ->
+        | Cancel(piece, offset, length) ->
             Array.concat
                 [ writeBigEndian 13
                   messageId MessageId.Cancel
                   writeBigEndian piece
-                  writeBigEndian ``begin``
+                  writeBigEndian offset
                   writeBigEndian length ]
 
     let deserialize (bytes: byte array) =
@@ -98,17 +105,75 @@ module Message =
         | _ -> failwithf "%i" (int bytes.[4])
 
     let calculatePieceSize (index: int) (state: State) =
-        let ``begin`` = index * BlockSize
+        let offset = index * BlockSize
 
         if index = state.NumberOfPieces - 1 then
-            ``begin``, state.PieceSize - ``begin``
+            offset, state.PieceSize - offset
         else
-            ``begin``, BlockSize
+            offset, BlockSize
 
-    let processMessage (peer: PeerConnection) (message: Message) (state: State) : PeerConnection * PeerAction option =
-        (*task {
-            let stream = peer.Connection.GetStream()
+    type Coordinator(pieces: PieceWork list) =
+        let agent =
+            MailboxProcessor<CoordinatorMessage>.Start(fun inbox ->
+                let rec loop (remainingPieces: PieceWork list) =
+                    async {
+                        let! action = inbox.Receive()
 
+                        match action with
+                        | HasUsefulPieces(pieces, replyChannel) ->
+                            let hasUsefulPieces =
+                                remainingPieces |> List.exists (fun work -> pieces.[work.Piece])
+
+                            if hasUsefulPieces then
+                                replyChannel.Reply true
+                            else
+                                replyChannel.Reply false
+                        | RequestPiece replyChannel ->
+                            match remainingPieces with
+                            | [] -> replyChannel.Reply None
+                            | head :: tail ->
+                                replyChannel.Reply(Some head)
+
+                                return! loop tail
+                    }
+
+                loop pieces)
+
+        member _.HasUsefulPieces(pieces: BitArray) =
+            agent.PostAndAsyncReply(fun channel -> HasUsefulPieces(pieces, channel))
+
+    type Worker(connection: PeerConnection, coordinator: Coordinator) =
+        let agent =
+            MailboxProcessor<Message>.Start(fun inbox ->
+                let rec loop (connection: PeerConnection) =
+                    async {
+                        let! message = inbox.Receive()
+
+                        match message with
+                        | Bitfield bitfield ->
+                            let withBitfield =
+                                { connection with
+                                    Bitfield = Some bitfield }
+
+                            let! hasUsefulPieces = coordinator.HasUsefulPieces bitfield
+
+                            if hasUsefulPieces then
+                                return!
+                                    loop
+                                        { withBitfield with
+                                            AmInterested = true }
+                            else
+                                return! loop withBitfield
+
+                        ()
+                    }
+
+                loop connection)
+
+        member _.ProcessMessage(message: Message) = agent.Post message
+
+    let readMessage (stream: NetworkStream) =
+        task {
             let lengthBuffer = Array.zeroCreate<byte> 4
 
             // TODO: Use CancellationToken
@@ -117,7 +182,8 @@ module Message =
             let length = BinaryPrimitives.ReadInt32BigEndian lengthBuffer
 
             if length = 0 then
-                return! processMessage peer
+                // NOTE: Maybe I should add KeepAlive to Message
+                return None
             else
                 let messageBuffer = Array.zeroCreate<byte> length
 
@@ -125,39 +191,18 @@ module Message =
 
                 let message = deserialize messageBuffer
 
-                let connection =
-                    match message with
-                    | Choke -> { peer with PeerChoking = true }
-                    | Unchoke -> { peer with PeerChoking = false }
+                return Some message
+        }
 
+    let rec foo (readMessage: unit -> Task<Message option>) (worker: Worker) =
+        task {
+            let! message = readMessage ()
 
-                return! processMessage connection
-        }*)
+            match message with
+            | None -> return! foo readMessage worker
+            | Some message ->
+                worker.ProcessMessage message
 
-        match message with
-        // NOTE: Maybe I should return the request with the actual request list
-        | Unchoke -> { peer with PeerChoking = false }, Some RequestBlocks
-        | Bitfield bitfield ->
-            let withBitfield = { peer with Bitfield = Some bitfield }
+                return! foo readMessage worker
 
-            if hasPiecesWeNeed bitfield state.Pieces then
-                { withBitfield with
-                    AmInterested = true },
-                Some SendInterested
-            else
-                withBitfield, None
-        | Have piece ->
-            // TODO: Reply with INTERESTED
-            match peer.Bitfield with
-            | None ->
-                let bitfield = BitArray state.NumberOfPieces
-
-                bitfield.Set(piece, true)
-
-                let withBitfield = { peer with Bitfield = Some bitfield }
-
-                withBitfield, None
-            | Some bitfield ->
-                bitfield.Set(piece, true)
-
-                peer, None
+        }

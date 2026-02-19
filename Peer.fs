@@ -35,14 +35,10 @@ type PieceWork =
 
 type State =
     { PieceHashes: byte array array
-      Pieces: ConcurrentDictionary<int, PieceWork>
+      Pieces: PieceWork list
       NumberOfPieces: int
       PieceSize: int
       TotalSize: int64 }
-
-type PeerAction =
-    | SendInterested
-    | RequestBlocks
 
 module Peer =
     let serializeHandshake (handshake: Handshake) =
