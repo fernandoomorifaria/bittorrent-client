@@ -3,6 +3,8 @@ namespace BitTorrent.Client
 open System
 open System.Buffers.Binary
 open System.Collections
+open System.Net.Sockets
+open System.Threading.Tasks
 
 type MessageId =
     | Choke = 0
@@ -32,9 +34,6 @@ type CoordinatorMessage =
     | PieceReceived
 
 module Message =
-    open System.Net.Sockets
-    open System.Threading.Tasks
-
     [<Literal>]
     let BlockSize = 16384
 
