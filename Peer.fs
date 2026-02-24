@@ -29,15 +29,21 @@ type PeerConnection =
 
 // TODO: Move this to another module
 type PieceWork =
-    { Piece: int
+    { Index: int
       Hash: byte array
       Length: int }
+
+type PieceProgress =
+    { Piece: int
+      Requests: int
+      Downloaded: int
+      Backlog: int }
 
 type State =
     { PieceHashes: byte array array
       Pieces: PieceWork list
       NumberOfPieces: int
-      PieceSize: int
+      PieceSize: int64
       TotalSize: int64 }
 
 module Peer =
