@@ -28,14 +28,12 @@ type Message =
     | Piece of piece: int * offset: int * block: byte array
     | Cancel of piece: int * offset: int * length: int
 
-type CoordinatorMessage =
-    | HasUsefulPieces of pieces: BitArray * replyChannel: AsyncReplyChannel<bool>
-    | RequestPiece of bitfield: BitArray * replyChannel: AsyncReplyChannel<PieceWork option>
-    | PieceReceived
-
 module Message =
     [<Literal>]
     let BlockSize = 16384
+
+    [<Literal>]
+    let MaxRequests = 5
 
     let serialize (message: Message) =
         let writeBigEndian value =
@@ -103,89 +101,6 @@ module Message =
         | MessageId.Cancel -> Cancel(readBigEndian 5, readBigEndian 9, readBigEndian 13)
         | _ -> failwithf "%i" (int bytes.[4])
 
-    let calculatePieceSize (index: int) (state: State) =
-        let beginOffset = int64 index * state.PieceSize
-        let endOffset = beginOffset + state.PieceSize
-
-        min endOffset state.TotalSize - beginOffset
-
-    type Coordinator(pieces: PieceWork list) =
-        let agent =
-            MailboxProcessor<CoordinatorMessage>.Start(fun inbox ->
-                let rec loop (remainingPieces: PieceWork list) =
-                    async {
-                        let! message = inbox.Receive()
-
-                        let nextPieces =
-                            match message with
-                            | HasUsefulPieces(pieces, replyChannel) ->
-                                remainingPieces
-                                |> List.exists (fun work -> pieces.[work.Index])
-                                |> replyChannel.Reply
-
-                                remainingPieces
-                            | RequestPiece(bitfield, replyChannel) ->
-                                let piece = remainingPieces |> List.tryFind (fun work -> bitfield.[work.Index])
-
-                                replyChannel.Reply piece
-
-                                match piece with
-                                | Some found -> remainingPieces |> List.filter (fun piece -> piece <> found)
-                                | None -> remainingPieces
-
-                        return! loop nextPieces
-                    }
-
-                loop pieces)
-
-        member _.HasUsefulPieces(pieces: BitArray) =
-            agent.PostAndAsyncReply(fun channel -> HasUsefulPieces(pieces, channel))
-
-        member _.RequestPiece(bitfield: BitArray) =
-            agent.PostAndAsyncReply(fun channel -> RequestPiece(bitfield, channel))
-
-    type PieceProgress = { Piece: PieceWork; Requests: int }
-
-    let sendRequests (connection: PeerConnection) (PieceProgress: PieceProgress) = ()
-
-    type Worker(connection: PeerConnection, coordinator: Coordinator) =
-        let agent =
-            MailboxProcessor<Message>.Start(fun inbox ->
-                let rec loop (connection: PeerConnection) (pieceProgress: PieceProgress option) =
-                    async {
-                        let! message = inbox.Receive()
-
-                        match message with
-                        | Unchoke ->
-                            let unchoked = { connection with AmChoking = false }
-
-                            let! piece = coordinator.RequestPiece connection.Bitfield.Value
-
-                            // TODO: Start piece download
-                            return! loop unchoked pieceProgress
-                        | Bitfield bitfield ->
-                            let withBitfield =
-                                { connection with
-                                    Bitfield = Some bitfield }
-
-                            let! hasUsefulPieces = coordinator.HasUsefulPieces bitfield
-
-                            if hasUsefulPieces then
-                                return!
-                                    loop
-                                        { withBitfield with
-                                            AmInterested = true }
-                                        pieceProgress
-                            else
-                                return! loop withBitfield pieceProgress
-
-                        ()
-                    }
-
-                loop connection None)
-
-        member _.ProcessMessage(message: Message) = agent.Post message
-
     let readMessage (stream: NetworkStream) =
         task {
             let lengthBuffer = Array.zeroCreate<byte> 4
@@ -206,17 +121,4 @@ module Message =
                 let message = deserialize messageBuffer
 
                 return Some message
-        }
-
-    let rec foo (readMessage: unit -> Task<Message option>) (worker: Worker) =
-        task {
-            let! message = readMessage ()
-
-            match message with
-            | None -> return! foo readMessage worker
-            | Some message ->
-                worker.ProcessMessage message
-
-                return! foo readMessage worker
-
         }

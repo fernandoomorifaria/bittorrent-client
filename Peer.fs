@@ -2,18 +2,11 @@ namespace BitTorrent.Client
 
 open System
 open System.Collections
-open System.Collections.Concurrent
 open System.IO
-open System.Text
 open System.Threading
 open System.Threading.Tasks
 open System.Net
 open System.Net.Sockets
-
-type Handshake =
-    { Protocol: string
-      InfoHash: byte array
-      PeerId: byte array }
 
 type Peer = { Ip: IPAddress; Port: uint16 }
 
@@ -27,50 +20,7 @@ type PeerConnection =
       PeerChoking: bool
       PeerInterested: bool }
 
-// TODO: Move this to another module
-type PieceWork =
-    { Index: int
-      Hash: byte array
-      Length: int }
-
-type PieceProgress =
-    { Piece: int
-      Requests: int
-      Downloaded: int
-      Backlog: int }
-
-type State =
-    { PieceHashes: byte array array
-      Pieces: PieceWork list
-      NumberOfPieces: int
-      PieceSize: int64
-      TotalSize: int64 }
-
 module Peer =
-    let serializeHandshake (handshake: Handshake) =
-        let protocolBytes = Encoding.ASCII.GetBytes handshake.Protocol
-
-        Array.concat
-            [ [| byte protocolBytes.Length |]
-              protocolBytes
-              Array.zeroCreate 8
-              handshake.InfoHash
-              handshake.PeerId ]
-
-    let deserializeHandshake (buffer: byte array) =
-        let protocolLength = buffer.[0]
-        let protocol = Encoding.ASCII.GetString(buffer, 1, int protocolLength)
-        let infoHash = buffer.[28..47]
-        let peerId = buffer.[48..67]
-
-        { Protocol = protocol
-          InfoHash = infoHash
-          PeerId = peerId }
-
-    let hasPiecesWeNeed (bitfield: BitArray) (pieces: ConcurrentDictionary<int, PieceWork>) =
-        pieces |> Seq.exists (fun piece -> bitfield.Get piece.Key)
-
-
     let connectToPeer (peer: Peer) (handshake: Handshake) : Task<PeerConnection option> =
         task {
             let client = new TcpClient()
@@ -85,13 +35,13 @@ module Peer =
 
                 let stream = client.GetStream()
 
-                let bytes = serializeHandshake handshake
+                let bytes = Handshake.serialize handshake
 
                 do! stream.WriteAsync bytes
 
                 let! buffer = stream.AsyncRead 68
 
-                let response = deserializeHandshake buffer
+                let response = Handshake.deserialize buffer
 
                 if handshake.InfoHash <> response.InfoHash then
                     client.Close()

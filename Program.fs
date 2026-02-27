@@ -4,6 +4,21 @@ open System.Net.Http
 open BencodeNET.Parsing
 open BencodeNET.Torrents
 open BitTorrent.Client
+open System.Threading.Tasks
+open Worker
+
+type State =
+    { PieceHashes: byte array array
+      Pieces: PieceWork list
+      NumberOfPieces: int
+      PieceSize: int64
+      TotalSize: int64 }
+
+let calculatePieceSize (index: int) (state: State) =
+    let beginOffset = int64 index * state.PieceSize
+    let endOffset = beginOffset + state.PieceSize
+
+    min endOffset state.TotalSize - beginOffset
 
 let client = new HttpClient()
 
