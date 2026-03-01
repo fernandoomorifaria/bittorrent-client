@@ -1,10 +1,9 @@
 namespace BitTorrent.Client
 
-open System
 open System.Buffers.Binary
 open System.Collections
 open System.Net.Sockets
-open System.Threading.Tasks
+open Utils
 
 type MessageId =
     | Choke = 0
@@ -36,17 +35,7 @@ module Message =
     let MaxRequests = 5
 
     let serialize (message: Message) =
-        let writeBigEndian value =
-            let bytes = Array.zeroCreate 4
-            BinaryPrimitives.WriteInt32BigEndian(bytes.AsSpan(), value)
-            bytes
-
         let messageId id = [| byte id |]
-
-        let bitArrayToBytes (bitArray: BitArray) =
-            let byteArray = Array.zeroCreate ((bitArray.Length + 7) / 8)
-            bitArray.CopyTo(byteArray, 0)
-            byteArray
 
         match message with
         | Choke -> Array.concat [ writeBigEndian 1; messageId MessageId.Choke ]
@@ -84,8 +73,7 @@ module Message =
                   writeBigEndian length ]
 
     let deserialize (bytes: byte array) =
-        let readBigEndian offset =
-            BinaryPrimitives.ReadInt32BigEndian(bytes.[offset .. offset + 3])
+        let readBigEndian = readBigEndian bytes
 
         let messageId = enum<MessageId> (int bytes.[4])
 

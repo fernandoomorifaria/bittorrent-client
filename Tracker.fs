@@ -54,7 +54,6 @@ module Tracker =
 
         trackerResponse
 
-
     let buildTrackerUrl (baseUrl: string) (parameters: TrackerParameters) =
         let query =
             [ "info_hash", Utils.encodeBytes parameters.InfoHash

@@ -1,5 +1,8 @@
 namespace BitTorrent.Client
 
+open System.Net.Sockets
+open System.Threading.Tasks
+open System.Security.Cryptography
 open Message
 open Coordinator
 
@@ -10,14 +13,16 @@ type PieceProgress =
       Requests: int }
 
 module Worker =
-    open System.Net.Sockets
-    open System.Threading.Tasks
-
     let createPieceProgress (pieceWork: PieceWork) =
         { Piece = pieceWork
           Requested = 0
           Received = 0
           Requests = 0 }
+
+    let checkIntegrity (hash: byte array) (piece: byte array) =
+        let pieceHash = SHA1.HashData piece
+
+        hash = piece
 
     let sendRequest (connection: PeerConnection) (pieceProgress: PieceProgress) =
         task {
@@ -95,6 +100,8 @@ module Worker =
                             if updatedProgress.Requests < MaxRequests then
                                 let! a = sendRequest connection updatedProgress |> Async.AwaitTask
 
+                                ()
+                            else if checkIntegrity pieceProgress.Piece.Hash block then
                                 ()
                             else
                                 ()
