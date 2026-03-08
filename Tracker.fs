@@ -74,8 +74,6 @@ module Tracker =
         task {
             let url = buildTrackerUrl baseUrl parameters
 
-            printfn "%s" url
-
             let! response = client.GetByteArrayAsync url
 
             return parseTrackerResponse response
@@ -87,8 +85,6 @@ module Tracker =
             // TODO: Implement announce to UDP tracker
 
             let! response = announceHttpTracker baseUrl parameters client
-
-            printfn "Peers: %i" response.Peers.Length
 
             return response
         }

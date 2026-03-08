@@ -1,24 +1,36 @@
-﻿open System.Linq
+﻿open System
+open System.IO
+open System.Linq
 open System.Text
 open System.Net.Http
 open BencodeNET.Parsing
 open BencodeNET.Torrents
 open BitTorrent.Client
 open System.Threading.Tasks
+open Coordinator
 open Worker
+open System.Net.Sockets
+open Message
+open System.Threading
 
-type State =
-    { PieceHashes: byte array array
-      Pieces: PieceWork list
-      NumberOfPieces: int
-      PieceSize: int64
-      TotalSize: int64 }
+let calculatePieceSize (index: int) (pieceSize: int64) (totalSize: int64) =
+    let beginOffset = int64 index * pieceSize
+    let endOffset = beginOffset + pieceSize
 
-let calculatePieceSize (index: int) (state: State) =
-    let beginOffset = int64 index * state.PieceSize
-    let endOffset = beginOffset + state.PieceSize
+    min endOffset totalSize - beginOffset |> int
 
-    min endOffset state.TotalSize - beginOffset
+let createMessageReader (connection: PeerConnection) : MessageReader =
+    let stream = connection.Connection.GetStream()
+
+    fun () -> readMessage stream
+
+let startWorker (reader: MessageReader) (worker: Worker) (ct: CancellationToken) =
+    task {
+        while true do
+            let! message = reader ()
+
+            worker.ProcessMessage message
+    }
 
 let client = new HttpClient()
 
@@ -30,7 +42,7 @@ let parser = BencodeParser()
 let peerId = "-qB5140-kwsSnUYwydys"
 
 let torrent =
-    parser.Parse<Torrent> "./kali-linux-2025.4-installer-amd64.iso.torrent"
+    parser.Parse<Torrent> "./kali-linux-2025.4-installer-netinst-amd64.iso.torrent"
 
 printfn "%A" torrent.Trackers
 
@@ -47,6 +59,7 @@ let request =
       Left = torrent.TotalSize
       Event = Started }
 
+// TODO: Combine the operations into a single pipeline
 let response =
     Tracker.announce baseUrl request client
     |> Async.AwaitTask
@@ -63,6 +76,39 @@ let connections =
     |> Async.RunSynchronously
 
 printfn "Connections: %i" connections.Length
+
+let pieces =
+    torrent.Pieces
+    |> Array.chunkBySize 20
+    |> Array.mapi (fun index pieceHash ->
+        { Index = index
+          Hash = pieceHash
+          Length = calculatePieceSize index torrent.PieceSize torrent.TotalSize })
+
+let fileName = torrent.File.FileName
+
+let stream =
+    new FileStream(fileName, FileMode.Create, FileAccess.Write, FileShare.None)
+
+let state =
+    { Stream = stream
+      Pieces = pieces
+      PieceSize = torrent.PieceSize }
+
+let cts = new CancellationTokenSource()
+
+let coordinator = Coordinator(state, cts)
+
+connections
+|> Array.map (fun connection ->
+    let reader = createMessageReader connection
+    let worker = Worker(connection, coordinator)
+
+    startWorker reader worker cts.Token)
+|> Task.WhenAll
+|> Async.AwaitTask
+|> Async.RunSynchronously
+|> ignore
 
 // TODO: Implement message loop, for now just close the connections
 connections |> Array.iter (fun peer -> peer.Connection.Close())

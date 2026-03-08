@@ -2,6 +2,7 @@ namespace BitTorrent.Client
 
 open System.Buffers.Binary
 open System.Collections
+open System.Threading.Tasks
 open System.Net.Sockets
 open Utils
 
@@ -17,6 +18,7 @@ type MessageId =
     | Cancel = 8
 
 type Message =
+    | KeepAlive
     | Choke
     | Unchoke
     | Interested
@@ -26,6 +28,8 @@ type Message =
     | Request of piece: int * offset: int * length: int
     | Piece of piece: int * offset: int * block: byte array
     | Cancel of piece: int * offset: int * length: int
+
+type MessageReader = unit -> Task<Message>
 
 module Message =
     [<Literal>]
@@ -71,42 +75,39 @@ module Message =
                   writeBigEndian piece
                   writeBigEndian offset
                   writeBigEndian length ]
+        | KeepAlive -> writeBigEndian 0
 
     let deserialize (bytes: byte array) =
         let readBigEndian = readBigEndian bytes
 
-        let messageId = enum<MessageId> (int bytes.[4])
+        let messageId = enum<MessageId> (int bytes.[0])
 
         match messageId with
         | MessageId.Choke -> Choke
         | MessageId.Unchoke -> Unchoke
         | MessageId.Interested -> Interested
         | MessageId.NotInterested -> NotInterested
-        | MessageId.Have -> Have(readBigEndian 5)
-        | MessageId.Bitfield -> Bitfield(BitArray(bytes[5..]))
-        | MessageId.Request -> Request(readBigEndian 5, readBigEndian 9, readBigEndian 13)
-        | MessageId.Piece -> Piece(readBigEndian 5, readBigEndian 9, bytes[13..])
-        | MessageId.Cancel -> Cancel(readBigEndian 5, readBigEndian 9, readBigEndian 13)
-        | _ -> failwithf "%i" (int bytes.[4])
+        | MessageId.Have -> Have(readBigEndian 1)
+        | MessageId.Bitfield -> Bitfield(BitArray(bytes[1..]))
+        | MessageId.Request -> Request(readBigEndian 1, readBigEndian 5, readBigEndian 9)
+        | MessageId.Piece -> Piece(readBigEndian 1, readBigEndian 5, bytes[9..])
+        | MessageId.Cancel -> Cancel(readBigEndian 1, readBigEndian 5, readBigEndian 9)
+        | _ -> KeepAlive
 
     let readMessage (stream: NetworkStream) =
         task {
             let lengthBuffer = Array.zeroCreate<byte> 4
 
             // TODO: Use CancellationToken
-            let! _ = stream.ReadAsync lengthBuffer
+            do! stream.ReadExactlyAsync lengthBuffer
 
             let length = BinaryPrimitives.ReadInt32BigEndian lengthBuffer
 
-            if length = 0 then
-                // NOTE: Maybe I should add KeepAlive to Message
-                return None
-            else
-                let messageBuffer = Array.zeroCreate<byte> length
+            let messageBuffer = Array.zeroCreate<byte> length
 
-                let! _ = stream.ReadAsync messageBuffer
+            let! _ = stream.ReadExactlyAsync messageBuffer
 
-                let message = deserialize messageBuffer
+            let message = deserialize messageBuffer
 
-                return Some message
+            return message
         }

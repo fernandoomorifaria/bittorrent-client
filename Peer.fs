@@ -48,8 +48,6 @@ module Peer =
 
                     return None
                 else
-                    printfn "Connected to %s" (peer.Ip.ToString())
-
                     return
                         Some
                             { Connection = client
@@ -64,8 +62,6 @@ module Peer =
             | :? IOException
             | :? OperationCanceledException ->
                 client.Close()
-
-                printfn "Failed to connect to peer %s" (peer.Ip.ToString())
 
                 return None
         }
