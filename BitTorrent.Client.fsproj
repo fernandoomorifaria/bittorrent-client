@@ -11,7 +11,7 @@
     <Compile Include="Peer.fs" />
     <Compile Include="Tracker.fs" />
     <Compile Include="Message.fs" />
-    <Compile Include="Coordinator.fs" />
+    <Compile Include="Supervisor.fs" />
     <Compile Include="Worker.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>

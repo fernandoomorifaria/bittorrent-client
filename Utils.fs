@@ -20,3 +20,7 @@ module Utils =
         let byteArray = Array.zeroCreate<byte> ((bitArray.Length + 7) / 8)
         bitArray.CopyTo(byteArray, 0)
         byteArray
+
+    let reverseByte (value: byte) =
+        [| 0..7 |]
+        |> Array.fold (fun reversed bit -> (reversed <<< 1) ||| ((value >>> bit) &&& 1uy)) 0uy

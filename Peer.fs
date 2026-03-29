@@ -21,27 +21,33 @@ type PeerConnection =
       PeerInterested: bool }
 
 module Peer =
-    let connectToPeer (peer: Peer) (handshake: Handshake) : Task<PeerConnection option> =
+    let connectToPeer
+        (peer: Peer)
+        (handshake: Handshake)
+        (timeout: TimeSpan)
+        (ct: CancellationToken)
+        : Task<PeerConnection option> =
         task {
             let client = new TcpClient()
 
-            client.ReceiveTimeout <- 5_000
-            client.SendTimeout <- 5_000
-
-            use cts = new CancellationTokenSource 5_000
-
             try
-                do! client.ConnectAsync(peer.Ip, peer.Port |> int, cts.Token)
+                use timeoutSource = CancellationTokenSource.CreateLinkedTokenSource ct
+
+                timeoutSource.CancelAfter timeout
+
+                do! client.ConnectAsync(peer.Ip, peer.Port |> int, timeoutSource.Token)
 
                 let stream = client.GetStream()
 
                 let bytes = Handshake.serialize handshake
 
-                do! stream.WriteAsync bytes
+                do! stream.WriteAsync(bytes, timeoutSource.Token)
 
-                let! buffer = stream.AsyncRead 68
+                let handshakeResponseBuffer = Array.zeroCreate<byte> 68
 
-                let response = Handshake.deserialize buffer
+                do! stream.ReadExactlyAsync(handshakeResponseBuffer, timeoutSource.Token)
+
+                let response = Handshake.deserialize handshakeResponseBuffer
 
                 if handshake.InfoHash <> response.InfoHash then
                     client.Close()
@@ -57,18 +63,20 @@ module Peer =
                               AmInterested = false
                               PeerChoking = true
                               PeerInterested = false }
-            with
-            | :? SocketException
-            | :? IOException
-            | :? OperationCanceledException ->
+            with exn ->
+                printfn "Failed to connect to peer %s: %s" (peer.Ip.ToString()) exn.Message
+
                 client.Close()
 
                 return None
         }
 
-    let connectToPeers (peers: Peer array) (handshake: Handshake) =
+    let connectToPeers (peers: Peer array) (handshake: Handshake) (timeout: TimeSpan) (ct: CancellationToken) =
         task {
-            let! results = peers |> Array.map (fun peer -> connectToPeer peer handshake) |> Task.WhenAll
+            let! results =
+                peers
+                |> Array.map (fun peer -> connectToPeer peer handshake timeout ct)
+                |> Task.WhenAll
 
             let connections = Array.choose id results
 

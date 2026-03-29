@@ -5,6 +5,7 @@ open System.Collections
 open System.Threading.Tasks
 open System.Net.Sockets
 open Utils
+open System.Threading
 
 type MessageId =
     | Choke = 0
@@ -17,6 +18,14 @@ type MessageId =
     | Piece = 7
     | Cancel = 8
 
+type Piece =
+    { Index: int
+      Offset: int
+      Block: byte array }
+
+type BlockRequest =
+    { Index: int; Offset: int; Length: int }
+
 type Message =
     | KeepAlive
     | Choke
@@ -26,10 +35,16 @@ type Message =
     | Have of piece: int
     | Bitfield of bitfield: BitArray
     | Request of piece: int * offset: int * length: int
-    | Piece of piece: int * offset: int * block: byte array
+    | Piece of Piece
     | Cancel of piece: int * offset: int * length: int
 
-type MessageReader = unit -> Task<Message>
+type MessageResult =
+    | Message of message: Message
+    | PeerDisconnected of reason: string
+
+type MessageReader = unit -> Task<MessageResult>
+
+type MessageSender = Message -> Task<unit>
 
 module Message =
     [<Literal>]
@@ -61,13 +76,13 @@ module Message =
                   writeBigEndian piece
                   writeBigEndian offset
                   writeBigEndian length ]
-        | Piece(piece, offset, block) ->
+        | Piece piece ->
             Array.concat
-                [ writeBigEndian (9 + block.Length)
+                [ writeBigEndian (9 + piece.Block.Length)
                   messageId MessageId.Piece
-                  writeBigEndian piece
-                  writeBigEndian offset
-                  block ]
+                  writeBigEndian piece.Index
+                  writeBigEndian piece.Offset
+                  piece.Block ]
         | Cancel(piece, offset, length) ->
             Array.concat
                 [ writeBigEndian 13
@@ -88,26 +103,33 @@ module Message =
         | MessageId.Interested -> Interested
         | MessageId.NotInterested -> NotInterested
         | MessageId.Have -> Have(readBigEndian 1)
-        | MessageId.Bitfield -> Bitfield(BitArray(bytes[1..]))
+        | MessageId.Bitfield -> Bitfield(BitArray(bytes[1..] |> Array.map reverseByte))
         | MessageId.Request -> Request(readBigEndian 1, readBigEndian 5, readBigEndian 9)
-        | MessageId.Piece -> Piece(readBigEndian 1, readBigEndian 5, bytes[9..])
+        | MessageId.Piece ->
+            Piece
+                { Index = readBigEndian 1
+                  Offset = readBigEndian 5
+                  Block = bytes[9..] }
         | MessageId.Cancel -> Cancel(readBigEndian 1, readBigEndian 5, readBigEndian 9)
         | _ -> KeepAlive
 
-    let readMessage (stream: NetworkStream) =
+    let readMessage (stream: NetworkStream) (ct: CancellationToken) =
         task {
             let lengthBuffer = Array.zeroCreate<byte> 4
 
-            // TODO: Use CancellationToken
-            do! stream.ReadExactlyAsync lengthBuffer
+            do! stream.ReadExactlyAsync(lengthBuffer, ct)
 
             let length = BinaryPrimitives.ReadInt32BigEndian lengthBuffer
 
-            let messageBuffer = Array.zeroCreate<byte> length
+            if length = 0 then
+                return KeepAlive
+            else
+                let messageBuffer = Array.zeroCreate<byte> length
 
-            let! _ = stream.ReadExactlyAsync messageBuffer
+                do! stream.ReadExactlyAsync(messageBuffer, ct)
 
-            let message = deserialize messageBuffer
-
-            return message
+                return deserialize messageBuffer
         }
+
+    let sendMessage (stream: NetworkStream) (message: Message) (ct: CancellationToken) =
+        stream.WriteAsync(serialize message, ct)

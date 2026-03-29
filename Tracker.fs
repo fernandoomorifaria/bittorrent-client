@@ -1,5 +1,7 @@
 namespace BitTorrent.Client
 
+open System
+open System.Threading.Tasks
 open System.Net
 open System.Net.Http
 open BencodeNET.Parsing
@@ -47,6 +49,7 @@ module Tracker =
                 let port = uint16 chunk[4] <<< 8 ||| uint16 chunk[5]
 
                 { Ip = ip; Port = port })
+            |> Array.filter (fun peer -> not (IPAddress.IsLoopback peer.Ip))
 
         let trackerResponse =
             { Interval = dictionary.Get<BNumber>("interval").Value |> int
@@ -54,7 +57,7 @@ module Tracker =
 
         trackerResponse
 
-    let buildTrackerUrl (baseUrl: string) (parameters: TrackerParameters) =
+    let buildHttpTrackerUrl (url: Uri) (parameters: TrackerParameters) =
         let query =
             [ "info_hash", Utils.encodeBytes parameters.InfoHash
               "peer_id", Utils.encodeBytes parameters.PeerId
@@ -63,28 +66,24 @@ module Tracker =
               "downloaded", string parameters.Downloaded
               "left", string parameters.Left
               "compact", "1"
-              "event", parameters.Event.ToString()
-              "numwant", string 200 ]
+              "event", parameters.Event.ToString() ]
             |> Seq.map (fun (k, v) -> sprintf "%s=%s" k v)
             |> String.concat "&"
 
-        $"{baseUrl}?{query}"
+        $"{url}?{query}"
 
-    let announceHttpTracker (baseUrl: string) (parameters: TrackerParameters) (client: HttpClient) =
+    let announceHttpTracker (url: Uri) (parameters: TrackerParameters) (client: HttpClient) =
         task {
-            let url = buildTrackerUrl baseUrl parameters
+            let url = buildHttpTrackerUrl url parameters
+
+            printfn "Announcing to Http tracker: %s" (url.ToString())
 
             let! response = client.GetByteArrayAsync url
 
             return parseTrackerResponse response
         }
 
-    // NOTE: Create an abstraction for the client, maybe
-    let announce (baseUrl: string) (parameters: TrackerParameters) (client: HttpClient) =
-        task {
-            // TODO: Implement announce to UDP tracker
-
-            let! response = announceHttpTracker baseUrl parameters client
-
-            return response
-        }
+    let announce (urls: Uri array) (parameters: TrackerParameters) (client: HttpClient) =
+        urls
+        |> Array.map (fun url -> announceHttpTracker url parameters client)
+        |> Task.WhenAll

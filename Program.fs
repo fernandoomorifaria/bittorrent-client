@@ -1,15 +1,12 @@
 ﻿open System
 open System.IO
-open System.Linq
 open System.Text
 open System.Net.Http
 open BencodeNET.Parsing
 open BencodeNET.Torrents
 open BitTorrent.Client
 open System.Threading.Tasks
-open Coordinator
 open Worker
-open System.Net.Sockets
 open Message
 open System.Threading
 
@@ -19,18 +16,34 @@ let calculatePieceSize (index: int) (pieceSize: int64) (totalSize: int64) =
 
     min endOffset totalSize - beginOffset |> int
 
-let createMessageReader (connection: PeerConnection) : MessageReader =
+let createMessageReader (connection: PeerConnection) (timeout: TimeSpan) (ct: CancellationToken) : MessageReader =
     let stream = connection.Connection.GetStream()
 
-    fun () -> readMessage stream
+    fun () ->
+        task {
+            try
+                use timeoutSource = CancellationTokenSource.CreateLinkedTokenSource ct
 
-let startWorker (reader: MessageReader) (worker: Worker) (ct: CancellationToken) =
-    task {
-        while true do
-            let! message = reader ()
+                timeoutSource.CancelAfter timeout
 
-            worker.ProcessMessage message
-    }
+                let! message = readMessage stream timeoutSource.Token
+
+                return Message message
+            with exn ->
+                return PeerDisconnected exn.Message
+        }
+
+let createMessageSender (connection: PeerConnection) (timeout: TimeSpan) (ct: CancellationToken) : MessageSender =
+    let stream = connection.Connection.GetStream()
+
+    fun (message: Message) ->
+        task {
+            use timeoutSource = CancellationTokenSource.CreateLinkedTokenSource ct
+
+            timeoutSource.CancelAfter timeout
+
+            do! sendMessage stream message timeoutSource.Token
+        }
 
 let client = new HttpClient()
 
@@ -41,74 +54,76 @@ let parser = BencodeParser()
 [<Literal>]
 let peerId = "-qB5140-kwsSnUYwydys"
 
+[<Literal>]
+let protocol = "BitTorrent protocol"
+
 let torrent =
     parser.Parse<Torrent> "./kali-linux-2025.4-installer-netinst-amd64.iso.torrent"
 
-printfn "%A" torrent.Trackers
+let urls =
+    torrent.Trackers
+    |> Seq.collect id
+    |> Seq.filter (fun url -> url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+    |> Seq.map (fun url -> Uri url)
+    |> Array.ofSeq
 
-// TODO: Announce for each tracker
-let baseUrl = torrent.Trackers.Last().First()
+let download () =
+    task {
+        let request =
+            { InfoHash = torrent.OriginalInfoHashBytes
+              PeerId = Encoding.ASCII.GetBytes peerId
+              Port = 58237
+              Uploaded = 0
+              Downloaded = 0
+              // TODO: Calculate the left size in case of calling the tracker again
+              Left = torrent.TotalSize
+              Event = Started }
 
-let request =
-    { InfoHash = torrent.OriginalInfoHashBytes
-      PeerId = Encoding.ASCII.GetBytes peerId
-      Port = 58237
-      Uploaded = 0
-      Downloaded = 0
-      // TODO: Calculate the left size in case of calling the tracker again
-      Left = torrent.TotalSize
-      Event = Started }
+        let! responses = Tracker.announce urls request client
 
-// TODO: Combine the operations into a single pipeline
-let response =
-    Tracker.announce baseUrl request client
-    |> Async.AwaitTask
-    |> Async.RunSynchronously
+        let peers = responses |> Array.collect (fun response -> response.Peers)
 
-let handshake =
-    { Protocol = "BitTorrent protocol"
-      InfoHash = torrent.OriginalInfoHashBytes
-      PeerId = Encoding.ASCII.GetBytes peerId }
+        let handshake =
+            { Protocol = protocol
+              InfoHash = torrent.OriginalInfoHashBytes
+              PeerId = Encoding.ASCII.GetBytes peerId }
 
-let connections =
-    Peer.connectToPeers response.Peers handshake
-    |> Async.AwaitTask
-    |> Async.RunSynchronously
+        use cts = new CancellationTokenSource()
 
-printfn "Connections: %i" connections.Length
+        let timeout = TimeSpan.FromSeconds 5L
 
-let pieces =
-    torrent.Pieces
-    |> Array.chunkBySize 20
-    |> Array.mapi (fun index pieceHash ->
-        { Index = index
-          Hash = pieceHash
-          Length = calculatePieceSize index torrent.PieceSize torrent.TotalSize })
+        let! connections = Peer.connectToPeers peers handshake timeout cts.Token
 
-let fileName = torrent.File.FileName
+        printfn "Connections: %i" connections.Length
 
-let stream =
-    new FileStream(fileName, FileMode.Create, FileAccess.Write, FileShare.None)
+        let pieces =
+            torrent.Pieces
+            |> Array.chunkBySize 20
+            |> Array.mapi (fun index pieceHash ->
+                { Index = index
+                  Hash = pieceHash
+                  Length = calculatePieceSize index torrent.PieceSize torrent.TotalSize })
 
-let state =
-    { Stream = stream
-      Pieces = pieces
-      PieceSize = torrent.PieceSize }
+        let fileName = torrent.File.FileName
 
-let cts = new CancellationTokenSource()
+        let stream =
+            new FileStream(fileName, FileMode.Create, FileAccess.Write, FileShare.None)
 
-let coordinator = Coordinator(state, cts)
+        let state =
+            { Stream = stream
+              Pieces = pieces
+              PieceSize = torrent.PieceSize }
 
-connections
-|> Array.map (fun connection ->
-    let reader = createMessageReader connection
-    let worker = Worker(connection, coordinator)
+        let supervisor = Supervisor.Supervisor(state, cts)
 
-    startWorker reader worker cts.Token)
-|> Task.WhenAll
-|> Async.AwaitTask
-|> Async.RunSynchronously
-|> ignore
+        do!
+            connections
+            |> Array.map (fun connection ->
+                let reader = createMessageReader connection timeout cts.Token
+                let sender = createMessageSender connection timeout cts.Token
 
-// TODO: Implement message loop, for now just close the connections
-connections |> Array.iter (fun peer -> peer.Connection.Close())
+                startWorker reader sender supervisor connection :> Task)
+            |> Task.WhenAll
+    }
+
+download () |> Async.AwaitTask |> Async.RunSynchronously
