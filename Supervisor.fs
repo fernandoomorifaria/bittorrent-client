@@ -14,109 +14,87 @@ type State =
       Pieces: PieceWork array
       PieceSize: int64 }
 
-type CoordinatorMessage =
+type SupervisorMessage =
     | HasUsefulPieces of pieces: BitArray * replyChannel: AsyncReplyChannel<bool>
     | RequestPiece of bitfield: BitArray * replyChannel: AsyncReplyChannel<PieceWork option>
     | PieceReceived of index: int * data: byte array
     | PieceFailed of PieceWork
 
 module Supervisor =
+    let writePieceToDisk (stream: FileStream) (index: int) (data: byte array) (pieceSize: int64) =
+        task {
+            let offset = int64 index * pieceSize
+
+            stream.Seek(offset, SeekOrigin.Begin) |> ignore
+            do! stream.WriteAsync(data, 0, data.Length)
+        }
+
     type Supervisor(state: State, cts: CancellationTokenSource) =
         let pieceMap = state.Pieces |> Array.map (fun p -> p.Index, p) |> Map.ofArray
 
         let agent =
-            MailboxProcessor<CoordinatorMessage>.Start(fun inbox ->
+            MailboxProcessor<SupervisorMessage>.Start(fun inbox ->
                 let rec loop (remainingPieces: Map<int, PieceWork>) (completedPieces: Set<int>) =
                     async {
                         let! message = inbox.Receive()
 
                         let stream = state.Stream
 
-                        let nextPieces, nextCompleted =
-                            match message with
-                            | HasUsefulPieces(pieces, replyChannel) ->
-                                pieceMap
-                                |> Map.exists (fun index _ -> pieces.[index] && not (completedPieces.Contains index))
-                                |> replyChannel.Reply
+                        match message with
+                        | HasUsefulPieces(pieces, replyChannel) ->
+                            pieceMap
+                            |> Map.exists (fun index _ -> pieces.[index] && not (completedPieces.Contains index))
+                            |> replyChannel.Reply
 
-                                remainingPieces, completedPieces
+                            return! loop remainingPieces completedPieces
+                        | RequestPiece(bitfield, replyChannel) ->
+                            let piece = remainingPieces |> Map.tryFindKey (fun index _ -> bitfield.[index])
 
-                            | RequestPiece(bitfield, replyChannel) ->
-                                let piece = remainingPieces |> Map.tryFindKey (fun index _ -> bitfield.[index])
+                            match piece with
+                            | Some i ->
+                                replyChannel.Reply(Some remainingPieces.[i])
 
-                                match piece with
-                                | Some i ->
-                                    replyChannel.Reply(Some remainingPieces.[i])
+                                return! loop (Map.remove i remainingPieces) completedPieces
+                            | None ->
+                                replyChannel.Reply None
 
-                                    printfn "Assigning piece %i (%i remaining)" i (remainingPieces.Count - 1)
+                                return! loop remainingPieces completedPieces
+                        | PieceReceived(index, data) ->
+                            if not (completedPieces.Contains index) then
+                                do! writePieceToDisk state.Stream index data state.PieceSize |> Async.AwaitTask
 
-                                    Map.remove i remainingPieces, completedPieces
-                                | None ->
-                                    let inFlightPiece =
-                                        pieceMap
-                                        |> Map.tryFindKey (fun index _ ->
-                                            bitfield.[index]
-                                            && not (completedPieces.Contains index)
-                                            && not (remainingPieces.ContainsKey index))
+                                let newCompleted = completedPieces.Add index
+                                let nextPieces = remainingPieces |> Map.remove index
 
-                                    match inFlightPiece with
-                                    | Some i ->
-                                        replyChannel.Reply(Some pieceMap.[i])
+                                printfn "Completed: %i of %i" newCompleted.Count state.Pieces.Length
 
-                                        printfn "Re-assigning in-flight piece %i" i
-                                    | None ->
-                                        replyChannel.Reply(None)
+                                if newCompleted.Count = state.Pieces.Length then
+                                    stream.Flush()
+                                    stream.Close()
+                                    cts.Cancel()
 
-                                        printfn
-                                            "No piece available for peer (%i remaining in map)"
-                                            remainingPieces.Count
+                                    printfn "Download finished."
 
-                                    remainingPieces, completedPieces
-
-                            | PieceReceived(index, data) ->
-                                if not (completedPieces.Contains index) then
-                                    let offset = int64 index * state.PieceSize
-
-                                    state.Stream.Seek(offset, SeekOrigin.Begin) |> ignore
-                                    state.Stream.Write(data, 0, data.Length)
-
-                                    let newCompleted = completedPieces.Add index
-
-                                    printfn "Completed: %i of %i" newCompleted.Count state.Pieces.Length
-
-                                    remainingPieces |> Map.remove index, newCompleted
+                                    return! loop nextPieces newCompleted
                                 else
-                                    remainingPieces, completedPieces
+                                    return! loop nextPieces newCompleted
+                            else
+                                return! loop remainingPieces completedPieces
 
-                            | PieceFailed piece ->
-                                if not (completedPieces.Contains piece.Index) then
-                                    printfn
-                                        "Piece %i returned to queue (%i remaining)"
-                                        piece.Index
-                                        (remainingPieces.Count + 1)
-
-                                    Map.add piece.Index piece remainingPieces, completedPieces
-                                else
-                                    remainingPieces, completedPieces
-
-                        if nextCompleted.Count = state.Pieces.Length then
-                            stream.Flush()
-                            stream.Close()
-                            cts.Cancel()
-
-                            // TODO: Check if it will be better if I end the loop
-                            return! loop nextPieces nextCompleted
-                        else
-                            return! loop nextPieces nextCompleted
+                        | PieceFailed piece ->
+                            if not (completedPieces.Contains piece.Index) then
+                                return! loop (Map.add piece.Index piece remainingPieces) completedPieces
+                            else
+                                return! loop remainingPieces completedPieces
                     }
 
                 loop pieceMap Set.empty)
 
         member _.HasUsefulPieces(pieces: BitArray) =
-            agent.PostAndReply(fun channel -> HasUsefulPieces(pieces, channel))
+            agent.PostAndAsyncReply(fun channel -> HasUsefulPieces(pieces, channel))
 
         member _.RequestPiece(bitfield: BitArray) =
-            agent.PostAndReply(fun channel -> RequestPiece(bitfield, channel))
+            agent.PostAndAsyncReply(fun channel -> RequestPiece(bitfield, channel))
 
         member _.PieceReceived(index: int, data: byte array) = agent.Post(PieceReceived(index, data))
 

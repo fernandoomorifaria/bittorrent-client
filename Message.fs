@@ -44,7 +44,7 @@ type MessageResult =
 
 type MessageReader = unit -> Task<MessageResult>
 
-type MessageSender = Message -> Task<unit>
+type MessageSender = Message -> Async<unit>
 
 module Message =
     [<Literal>]
@@ -103,21 +103,21 @@ module Message =
         | MessageId.Interested -> Interested
         | MessageId.NotInterested -> NotInterested
         | MessageId.Have -> Have(readBigEndian 1)
-        | MessageId.Bitfield -> Bitfield(BitArray(bytes[1..] |> Array.map reverseByte))
+        | MessageId.Bitfield -> Bitfield(BitArray(bytes |> Array.map reverseByte))
         | MessageId.Request -> Request(readBigEndian 1, readBigEndian 5, readBigEndian 9)
         | MessageId.Piece ->
             Piece
                 { Index = readBigEndian 1
                   Offset = readBigEndian 5
-                  Block = bytes[9..] }
+                  Block = bytes.[9..] }
         | MessageId.Cancel -> Cancel(readBigEndian 1, readBigEndian 5, readBigEndian 9)
         | _ -> KeepAlive
 
-    let readMessage (stream: NetworkStream) (ct: CancellationToken) =
+    let readMessage (stream: NetworkStream) =
         task {
             let lengthBuffer = Array.zeroCreate<byte> 4
 
-            do! stream.ReadExactlyAsync(lengthBuffer, ct)
+            do! stream.ReadExactlyAsync lengthBuffer
 
             let length = BinaryPrimitives.ReadInt32BigEndian lengthBuffer
 
@@ -126,10 +126,10 @@ module Message =
             else
                 let messageBuffer = Array.zeroCreate<byte> length
 
-                do! stream.ReadExactlyAsync(messageBuffer, ct)
+                do! stream.ReadExactlyAsync messageBuffer
 
                 return deserialize messageBuffer
         }
 
-    let sendMessage (stream: NetworkStream) (message: Message) (ct: CancellationToken) =
-        stream.WriteAsync(serialize message, ct)
+    let sendMessage (stream: NetworkStream) (message: Message) =
+        stream.WriteAsync(serialize message).AsTask() |> Async.AwaitTask

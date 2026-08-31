@@ -1,11 +1,11 @@
 ﻿open System
+open System.Buffers
 open System.IO
 open System.Text
 open System.Net.Http
 open BencodeNET.Parsing
 open BencodeNET.Torrents
 open BitTorrent.Client
-open System.Threading.Tasks
 open Worker
 open Message
 open System.Threading
@@ -16,34 +16,23 @@ let calculatePieceSize (index: int) (pieceSize: int64) (totalSize: int64) =
 
     min endOffset totalSize - beginOffset |> int
 
-let createMessageReader (connection: PeerConnection) (timeout: TimeSpan) (ct: CancellationToken) : MessageReader =
-    let stream = connection.Connection.GetStream()
+let createMessageReader (peer: PeerConnection) : MessageReader =
+    let stream = peer.Connection.GetStream()
 
     fun () ->
         task {
             try
-                use timeoutSource = CancellationTokenSource.CreateLinkedTokenSource ct
-
-                timeoutSource.CancelAfter timeout
-
-                let! message = readMessage stream timeoutSource.Token
+                let! message = readMessage stream
 
                 return Message message
             with exn ->
                 return PeerDisconnected exn.Message
         }
 
-let createMessageSender (connection: PeerConnection) (timeout: TimeSpan) (ct: CancellationToken) : MessageSender =
-    let stream = connection.Connection.GetStream()
+let createMessageSender (peer: PeerConnection) : MessageSender =
+    let stream = peer.Connection.GetStream()
 
-    fun (message: Message) ->
-        task {
-            use timeoutSource = CancellationTokenSource.CreateLinkedTokenSource ct
-
-            timeoutSource.CancelAfter timeout
-
-            do! sendMessage stream message timeoutSource.Token
-        }
+    fun (message: Message) -> sendMessage stream message
 
 let client = new HttpClient()
 
@@ -118,12 +107,16 @@ let download () =
 
         do!
             connections
+            |> Array.truncate 40
             |> Array.map (fun connection ->
-                let reader = createMessageReader connection timeout cts.Token
-                let sender = createMessageSender connection timeout cts.Token
+                let reader = createMessageReader connection
+                let sender = createMessageSender connection
+                let worker = Worker(connection, sender, supervisor)
 
-                startWorker reader sender supervisor connection :> Task)
-            |> Task.WhenAll
+                startWorker reader worker)
+            |> Async.Parallel
+            |> Async.Ignore
+            |> Async.StartAsTask
     }
 
 download () |> Async.AwaitTask |> Async.RunSynchronously

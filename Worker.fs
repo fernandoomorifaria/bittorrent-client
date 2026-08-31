@@ -1,9 +1,6 @@
 namespace BitTorrent.Client
 
 open System.Collections
-open System.Threading
-open System.Threading.Tasks
-open System.Net.Sockets
 open System.Security.Cryptography
 open Message
 open Supervisor
@@ -30,27 +27,26 @@ module Worker =
 
     let checkIntegrity (hash: byte array) (piece: byte array) = SHA1.HashData piece = hash
 
-    // NOTE: Maybe wrap in a try block
-    let rec sendRequest (sendMessage: MessageSender) (pieceProgress: PieceProgress) =
+    let sendRequest (sendMessage: MessageSender) (pieceProgress: PieceProgress) =
         task {
             let piece = pieceProgress.Piece
+            let mutable progress = pieceProgress
 
             // TODO: Check if peer is unchoked
-            if pieceProgress.Requests < MaxRequests && pieceProgress.Requests < piece.Length then
-                let blockSize = min BlockSize (piece.Length - pieceProgress.Requested)
+            while progress.Requests < MaxRequests && progress.Requests < piece.Length do
+                let blockSize = min BlockSize (piece.Length - progress.Requested)
 
-                let request = Request(piece.Index, pieceProgress.Requested, blockSize)
+                let request = Request(piece.Index, progress.Requested, blockSize)
 
+                // NOTE: Not proud of this but TCO doesn't work with Tasks
                 do! sendMessage request
 
-                let updatedProgress =
-                    { pieceProgress with
-                        Requests = pieceProgress.Requests + 1
-                        Requested = pieceProgress.Requested + blockSize }
+                progress <-
+                    { progress with
+                        Requests = progress.Requests + 1
+                        Requested = progress.Requested + blockSize }
 
-                return! sendRequest sendMessage updatedProgress
-            else
-                return pieceProgress
+            return progress
         }
 
     let handleChoke (peer: PeerConnection) (supervisor: Supervisor) (pieceProgress: PieceProgress option) =
@@ -101,7 +97,7 @@ module Worker =
 
         Array.blit piece.Block 0 pieceReceivedProgress.Data piece.Offset piece.Block.Length
 
-        if pieceReceivedProgress.Received >= pieceProgress.Piece.Length then
+        if pieceReceivedProgress.Received = pieceProgress.Piece.Length then
             if checkIntegrity pieceReceivedProgress.Piece.Hash pieceReceivedProgress.Data then
                 PieceCompleted pieceReceivedProgress.Data
             else
@@ -116,95 +112,96 @@ module Worker =
             return! sendRequest sendMessage progress
         }
 
-    let startWorker
-        (readMessage: MessageReader)
-        (sendMessage: MessageSender)
-        (supervisor: Supervisor)
-        (peer: PeerConnection)
-        =
-        let rec loop (peer: PeerConnection) (pieceProgress: PieceProgress option) =
-            task {
-                try
-                    let! message = readMessage ()
+    type Worker(peer: PeerConnection, sendMessage: MessageSender, supervisor: Supervisor) =
+        let agent =
+            MailboxProcessor<MessageResult>.Start(fun inbox ->
+                let rec loop (peer: PeerConnection) (pieceProgress: PieceProgress option) =
+                    async {
+                        let! message = inbox.Receive()
 
-                    match message with
-                    | Message message ->
                         match message with
-                        | Interested
-                        | NotInterested
-                        | Request _
-                        | Cancel _
-                        | KeepAlive
-                        | Have _ -> return! loop peer pieceProgress
-                        | Choke ->
-                            let chokedPeer = handleChoke peer supervisor pieceProgress
+                        | Message message ->
+                            match message with
+                            | Interested
+                            | NotInterested
+                            | Request _
+                            | Cancel _
+                            | KeepAlive
+                            | Have _ -> return! loop peer pieceProgress
+                            | Choke ->
+                                let chokedPeer = handleChoke peer supervisor pieceProgress
 
-                            return! loop chokedPeer None
-                        | Unchoke ->
-                            let pieceWork = supervisor.RequestPiece peer.Bitfield.Value
+                                return! loop chokedPeer None
+                            | Unchoke ->
+                                let! pieceWork = supervisor.RequestPiece peer.Bitfield.Value
 
-                            match pieceWork with
+                                match pieceWork with
+                                | None -> ()
+                                | Some work ->
+                                    let! unchokedPeer, pieceProgress =
+                                        handleUnchoke work sendMessage peer |> Async.AwaitTask
+
+                                    return! loop unchokedPeer pieceProgress
+                            | Bitfield bitfield ->
+                                let! hasUsefulPieces = supervisor.HasUsefulPieces bitfield
+
+                                let! peerWithBitfield =
+                                    handleBitfield bitfield hasUsefulPieces sendMessage peer |> Async.AwaitTask
+
+                                return! loop peerWithBitfield pieceProgress
+                            | Piece piece ->
+                                let result = processPiece pieceProgress.Value piece
+
+                                match result with
+                                | RequestBlock pieceProgress ->
+                                    let! nextRequestProgress = sendRequest sendMessage pieceProgress |> Async.AwaitTask
+
+                                    return! loop peer (Some nextRequestProgress)
+                                | PieceCompleted data ->
+                                    supervisor.PieceReceived(piece.Index, data)
+
+                                    do! sendMessage (Have piece.Index)
+
+                                    let! pieceWork = supervisor.RequestPiece peer.Bitfield.Value
+
+                                    match pieceWork with
+                                    | None -> ()
+                                    | Some work ->
+                                        let! nextPieceProgress = requestPiece work sendMessage |> Async.AwaitTask
+
+                                        return! loop peer (Some nextPieceProgress)
+                                | PieceFailed ->
+                                    supervisor.PieceFailed pieceProgress.Value.Piece
+
+                                    let! pieceWork = supervisor.RequestPiece peer.Bitfield.Value
+
+                                    match pieceWork with
+                                    | None -> ()
+                                    | Some work ->
+                                        let! nextPieceProgress = requestPiece work sendMessage |> Async.AwaitTask
+
+                                        return! loop peer (Some nextPieceProgress)
+                        | PeerDisconnected reason ->
+                            printfn "Peer disconnected: %s" reason
+
+                            match pieceProgress with
+                            | Some { Piece = piece } -> supervisor.PieceFailed piece
                             | None -> ()
-                            | Some work ->
-                                let! unchokedPeer, pieceProgress = handleUnchoke work sendMessage peer
 
-                                return! loop unchokedPeer pieceProgress
-                        | Bitfield bitfield ->
-                            let hasUsefulPieces = supervisor.HasUsefulPieces bitfield
+                            peer.Connection.Close()
+                    }
 
-                            let! peerWithBitfield = handleBitfield bitfield hasUsefulPieces sendMessage peer
+                loop peer None)
 
-                            return! loop peerWithBitfield pieceProgress
-                        | Piece piece ->
-                            let result = processPiece pieceProgress.Value piece
+        member _.ProcessMessage(message: MessageResult) = agent.Post message
 
-                            match result with
-                            | RequestBlock pieceProgress ->
-                                let! nextRequestProgress = sendRequest sendMessage pieceProgress
+    let rec startWorker (readMessage: MessageReader) (worker: Worker) =
+        async {
+            let! message = readMessage () |> Async.AwaitTask
 
-                                return! loop peer (Some nextRequestProgress)
-                            | PieceCompleted data ->
-                                supervisor.PieceReceived(piece.Index, data)
+            worker.ProcessMessage message
 
-                                do! sendMessage (Have piece.Index)
-
-                                let pieceWork = supervisor.RequestPiece peer.Bitfield.Value
-
-                                match pieceWork with
-                                | None -> ()
-                                | Some work ->
-                                    let! nextPieceProgress = requestPiece work sendMessage
-
-                                    return! loop peer (Some nextPieceProgress)
-                            | PieceFailed ->
-                                supervisor.PieceFailed pieceProgress.Value.Piece
-
-                                let pieceWork = supervisor.RequestPiece peer.Bitfield.Value
-
-                                match pieceWork with
-                                | None -> ()
-                                | Some work ->
-                                    let! nextPieceProgress = requestPiece work sendMessage
-
-                                    return! loop peer (Some nextPieceProgress)
-
-                    // TODO: Send piece failed
-                    | PeerDisconnected reason ->
-                        printfn "Peer disconnected: %s" reason
-
-                        match pieceProgress with
-                        | Some { Piece = piece } -> supervisor.PieceFailed piece
-                        | None -> ()
-
-                        peer.Connection.Close()
-                with exn ->
-                    printfn "%s" exn.Message
-
-                    match pieceProgress with
-                    | Some { Piece = piece } -> supervisor.PieceFailed piece
-                    | None -> ()
-
-                    peer.Connection.Close()
-            }
-
-        loop peer None
+            match message with
+            | PeerDisconnected _ -> ()
+            | Message _ -> return! startWorker readMessage worker
+        }
